@@ -142,7 +142,7 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...b
 	var h []fr.Element
 	chHDone := make(chan struct{}, 1)
 	go func() {
-		h = computeH(solution.A, solution.B, solution.C, &pk.Domain)
+		h = computeH(solution.A, solution.B, wireValues[:r1cs.GetNbPublicVariables()], &pk.Domain)
 		solution.A = nil
 		solution.B = nil
 		solution.C = nil
@@ -232,9 +232,8 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...b
 
 		var krs, krs2, p1 curve.G1Jac
 		chKrs2Done := make(chan error, 1)
-		sizeH := int(pk.Domain.Cardinality - 1) // comes from the fact the deg(H)=(n-1)+(n-1)-n=n-2
 		go func() {
-			_, err := krs2.MultiExp(pk.G1.Z, h[:sizeH], ecc.MultiExpConfig{NbTasks: n / 2})
+			_, err := krs2.MultiExp(pk.G1.Z, h, ecc.MultiExpConfig{NbTasks: n / 2})
 			chKrs2Done <- err
 		}()
 
@@ -353,47 +352,63 @@ func filterHeap(slice []fr.Element, sliceFirstIndex int, toRemove []int) (r []fr
 	return
 }
 
-func computeH(a, b, c []fr.Element, domain *fft.Domain) []fr.Element {
-	// H part of Krs
-	// Compute H (hz=ab-c, where z=-2 on ker X^n+1 (z(x)=x^n-1))
-	// 	1 - _a = ifft(a), _b = ifft(b), _c = ifft(c)
-	// 	2 - ca = fft_coset(_a), ba = fft_coset(_b), cc = fft_coset(_c)
-	// 	3 - h = ifft_coset(ca o cb - cc)
+func computeH(a, b, w []fr.Element, domain *fft.Domain) []fr.Element {
+	nbConstraints, nbPublicWires := len(a), len(w)
+	n := int(domain.Cardinality)
+	if nbConstraints+nbPublicWires > n {
+		panic("invalid domain")
+	}
 
-	n := len(a)
-
-	// add padding to ensure input length is domain cardinality
-	padding := make([]fr.Element, int(domain.Cardinality)-n)
-	a = append(a, padding...)
-	b = append(b, padding...)
-	c = append(c, padding...)
-	n = len(a)
-
-	domain.FFTInverse(a, fft.DIF)
-	domain.FFTInverse(b, fft.DIF)
-	domain.FFTInverse(c, fft.DIF)
-
-	domain.FFT(a, fft.DIT, fft.OnCoset())
-	domain.FFT(b, fft.DIT, fft.OnCoset())
-	domain.FFT(c, fft.DIT, fft.OnCoset())
-
-	var den, one fr.Element
-	one.SetOne()
-	den.Exp(domain.FrMultiplicativeGen, big.NewInt(int64(domain.Cardinality)))
-	den.Sub(&den, &one).Inverse(&den)
-
-	// h = ifft_coset(ca o cb - cc)
-	// reusing a to avoid unnecessary memory allocation
-	utils.Parallelize(n, func(start, end int) {
+	ab := make([]fr.Element, n)
+	utils.Parallelize(nbConstraints, func(start, end int) {
 		for i := start; i < end; i++ {
-			a[i].Mul(&a[i], &b[i]).
-				Sub(&a[i], &c[i]).
-				Mul(&a[i], &den)
+			ab[i].Mul(&a[i], &b[i])
 		}
 	})
 
-	// ifft_coset
-	domain.FFTInverse(a, fft.DIF, fft.OnCoset())
+	// add padding to ensure input length is domain cardinality
+	a = append(a, make([]fr.Element, n-len(a))...)
+	b = append(b, make([]fr.Element, n-len(b))...)
+
+	// copy the wires after the constraints into a
+	copy(a[nbConstraints:], w)
+
+	fft.BitReverse(a)
+	domain.FFTInverse(a, fft.DIT)
+	fft.BitReverse(b)
+	domain.FFTInverse(b, fft.DIT)
+	fft.BitReverse(ab)
+	domain.FFTInverse(ab, fft.DIT)
+
+	rootOfUnity, err := fft.Generator(domain.Cardinality * 2)
+	if err != nil {
+		panic(err)
+	}
+
+	utils.Parallelize(n, func(start, end int) {
+		var pow fr.Element
+		pow.Exp(rootOfUnity, big.NewInt(int64(start)))
+		for i := start; i < end; i++ {
+			a[i].Mul(&a[i], &pow)
+			b[i].Mul(&b[i], &pow)
+			ab[i].Mul(&ab[i], &pow)
+			pow.Mul(&pow, &rootOfUnity)
+		}
+	})
+
+	domain.FFT(a, fft.DIF)
+	fft.BitReverse(a)
+	domain.FFT(b, fft.DIF)
+	fft.BitReverse(b)
+	domain.FFT(ab, fft.DIF)
+	fft.BitReverse(ab)
+
+	// reusing a to avoid unnecessary memory allocation
+	utils.Parallelize(n, func(start, end int) {
+		for i := start; i < end; i++ {
+			a[i].Mul(&a[i], &b[i]).Sub(&a[i], &ab[i])
+		}
+	})
 
 	return a
 }
